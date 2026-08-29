@@ -1,0 +1,199 @@
+name: Publish iOS static builds
+
+# Fork automation for NucleusFramework/ComposePdfReader (issue #11).
+#
+# Upstream ships shared libraries only ("we don't plan to add static builds"),
+# but a dylib cannot be packed into a Kotlin/Native cinterop klib: consumers of
+# the published `dev.nucleusframework:pdfium` artefact would have to drop the
+# binary in themselves and embed + sign it in Xcode. A static archive can be
+# packed, so this workflow runs the upstream harness with `build_type=static`
+# (which sets `pdf_is_complete_lib = true` and `use_custom_libcxx = false`, the
+# combination that makes the archive self-contained against Apple's libc++) and
+# publishes the result as a release here.
+#
+# Runs daily and tracks bblanchon's latest release, so a new PDFium version is
+# available as a static archive before ComposePdfReader's own auto-release bumps
+# its pin.
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # daily 01:00 UTC — before ComposePdfReader's 03:00 auto-release
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build (e.g. chromium/8021). Defaults to the latest.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nucleus-ios-static
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync build harness from upstream
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/bblanchon/pdfium-binaries.git
+          git fetch upstream master
+          # Everything except .github/: GITHUB_TOKEN is not allowed to push
+          # workflow files, so upstream workflow changes are reported instead.
+          git checkout upstream/master -- $(git ls-tree --name-only upstream/master | grep -v '^\.github$' | tr '\n' ' ')
+          if git diff --cached --quiet; then
+            echo "Build harness already up to date."
+          else
+            git commit -m "chore: sync build harness with bblanchon/pdfium-binaries"
+            git push origin HEAD:master
+          fi
+          if ! git diff --quiet HEAD:.github/workflows/build.yml upstream/master:.github/workflows/build.yml; then
+            echo "::warning::Upstream .github/workflows/build.yml changed — update this fork's copy by hand."
+          fi
+
+  detect:
+    name: Resolve version to build
+    needs: sync
+    runs-on: ubuntu-24.04
+    outputs:
+      needs_build: ${{ steps.check.outputs.needs_build }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      build: ${{ steps.upstream.outputs.build }}
+      version: ${{ steps.upstream.outputs.version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Resolve upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            release=$(gh api "repos/bblanchon/pdfium-binaries/releases/tags/$INPUT_TAG")
+          else
+            release=$(gh api repos/bblanchon/pdfium-binaries/releases/latest)
+          fi
+          tag=$(echo "$release" | jq -r .tag_name)
+          version=$(echo "$release" | jq -r .name | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse a version out of the release name"
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "build=${tag#chromium/}"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream: $tag ($version)"
+
+      - name: Check whether we already published it
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_tag="ios-static-${{ steps.upstream.outputs.build }}"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "$release_tag already published — nothing to do."
+          else
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  device:
+    name: iOS device (arm64, static)
+    needs: detect
+    if: needs.detect.outputs.needs_build == 'true'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/build.yml
+    with:
+      branch: ${{ needs.detect.outputs.tag }}
+      version: ${{ needs.detect.outputs.version }}
+      target_os: ios
+      target_cpu: arm64
+      target_environment: device
+      build_type: static
+
+  simulator:
+    name: iOS simulator (arm64, static)
+    needs: detect
+    if: needs.detect.outputs.needs_build == 'true'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/build.yml
+    with:
+      branch: ${{ needs.detect.outputs.tag }}
+      version: ${{ needs.detect.outputs.version }}
+      target_os: ios
+      target_cpu: arm64
+      target_environment: simulator
+      build_type: static
+
+  publish:
+    name: Publish release
+    needs: [detect, device, simulator]
+    if: needs.detect.outputs.needs_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download device build
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.device.outputs.artifact }}
+          path: staging/device
+
+      - name: Download simulator build
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ needs.simulator.outputs.artifact }}
+          path: staging/simulator
+
+      - name: Package
+        env:
+          BUILD: ${{ needs.detect.outputs.build }}
+        run: |
+          set -euo pipefail
+          out="pdfium-ios-static-$BUILD"
+          mkdir -p "$out/lib/ios-arm64" "$out/lib/ios-simulator-arm64"
+          # The headers are identical in both builds; ship one copy.
+          cp -R staging/device/include "$out/include"
+          cp staging/device/LICENSE staging/device/args.gn "$out/"
+          [ -f staging/device/VERSION ] && cp staging/device/VERSION "$out/"
+          cp staging/device/lib/libpdfium.a "$out/lib/ios-arm64/libpdfium.a"
+          cp staging/simulator/lib/libpdfium.a "$out/lib/ios-simulator-arm64/libpdfium.a"
+          tar czf "$out.tgz" "$out"
+          sha256sum "$out.tgz" > "$out.tgz.sha256"
+          ls -lh "$out.tgz"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD: ${{ needs.detect.outputs.build }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          RELEASE_TAG: ${{ needs.detect.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "PDFium $VERSION — iOS static" \
+            --notes "Static \`libpdfium.a\` for \`ios-arm64\` and \`ios-simulator-arm64\`, built from upstream \`$TAG\` with \`build_type=static\` (\`pdf_is_complete_lib = true\`, \`use_custom_libcxx = false\`).
+
+          Consumed by [NucleusFramework/ComposePdfReader](https://github.com/NucleusFramework/ComposePdfReader) — \`:pdfium:installPdfiumIos\` downloads this archive and cinterop packs it into the published klib." \
+            "pdfium-ios-static-$BUILD.tgz" \
+            "pdfium-ios-static-$BUILD.tgz.sha256"
