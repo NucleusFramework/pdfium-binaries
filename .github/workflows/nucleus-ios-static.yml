@@ -149,7 +149,9 @@ jobs:
     name: Publish release
     needs: [detect, device, simulator]
     if: needs.detect.outputs.needs_build == 'true'
-    runs-on: ubuntu-24.04
+    # macOS runner: the archives ship full DWARF (268 MB each) and have to be
+    # stripped with Apple's strip before they end up inside a published klib.
+    runs-on: macos-15
     steps:
       - name: Download device build
         uses: actions/download-artifact@v6
@@ -176,8 +178,18 @@ jobs:
           if [ -f staging/device/VERSION ]; then cp staging/device/VERSION "$out/"; fi
           cp staging/device/lib/libpdfium.a "$out/lib/ios-arm64/libpdfium.a"
           cp staging/simulator/lib/libpdfium.a "$out/lib/ios-simulator-arm64/libpdfium.a"
+          # Drop debug symbols: ~268 MB -> ~16 MB per slice. The archives are
+          # packed verbatim into the cinterop klib, so this is the size every
+          # consumer of dev.nucleusframework:pdfium downloads.
+          for a in "$out"/lib/*/libpdfium.a; do
+            xcrun strip -S "$a"
+            xcrun ranlib "$a"
+            echo "$a -> $(du -h "$a" | cut -f1)"
+            xcrun nm -gjU "$a" | grep -q '^_FPDF_InitLibraryWithConfig$' \
+              || { echo "::error::$a lost its PDFium symbols"; exit 1; }
+          done
           tar czf "$out.tgz" "$out"
-          sha256sum "$out.tgz" > "$out.tgz.sha256"
+          shasum -a 256 "$out.tgz" > "$out.tgz.sha256"
           ls -lh "$out.tgz"
 
       - name: Create release
