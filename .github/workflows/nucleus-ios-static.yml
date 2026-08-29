@@ -173,7 +173,7 @@ jobs:
           # The headers are identical in both builds; ship one copy.
           cp -R staging/device/include "$out/include"
           cp staging/device/LICENSE staging/device/args.gn "$out/"
-          [ -f staging/device/VERSION ] && cp staging/device/VERSION "$out/"
+          if [ -f staging/device/VERSION ]; then cp staging/device/VERSION "$out/"; fi
           cp staging/device/lib/libpdfium.a "$out/lib/ios-arm64/libpdfium.a"
           cp staging/simulator/lib/libpdfium.a "$out/lib/ios-simulator-arm64/libpdfium.a"
           tar czf "$out.tgz" "$out"
