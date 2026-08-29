@@ -185,8 +185,13 @@ jobs:
             xcrun strip -S "$a"
             xcrun ranlib "$a"
             echo "$a -> $(du -h "$a" | cut -f1)"
-            xcrun nm -gjU "$a" | grep -q '^_FPDF_InitLibraryWithConfig$' \
-              || { echo "::error::$a lost its PDFium symbols"; exit 1; }
+            # Write to a file rather than piping: `grep -q` exits on the first
+            # match, and the resulting SIGPIPE fails the pipeline under pipefail.
+            xcrun nm -gjU "$a" > /tmp/syms.txt
+            if ! grep -qx '_FPDF_InitLibraryWithConfig' /tmp/syms.txt; then
+              echo "::error::$a lost its PDFium symbols"
+              exit 1
+            fi
           done
           tar czf "$out.tgz" "$out"
           shasum -a 256 "$out.tgz" > "$out.tgz.sha256"
