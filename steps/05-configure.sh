@@ -53,12 +53,19 @@ mkdir -p "$BUILD"
       [ -n "$TARGET_ENVIRONMENT" ] && echo "target_environment = \"$TARGET_ENVIRONMENT\""
       if [ "$ENABLE_V8" == "true" ]; then
         echo 'ios_deployment_target = "17.4"'
+        case "$TARGET_CPU" in
+            arm64)
+                echo 'arm_control_flow_integrity = "none"'
+                ;;
+            x64)
+                echo 'v8_enable_builtins_optimization = true'
+                ;;
+        esac
       else
         echo 'ios_deployment_target = "17.0"'
       fi
       echo "ios_enable_code_signing = false"
       echo "use_blink = true"
-      [ "$ENABLE_V8" == "true" ] && [ "$TARGET_CPU" == "arm64" ] && echo 'arm_control_flow_integrity = "none"'
       echo "clang_use_chrome_plugins = false"
       ;;
     linux)
